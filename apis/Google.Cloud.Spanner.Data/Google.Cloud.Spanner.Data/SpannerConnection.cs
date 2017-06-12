@@ -14,6 +14,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
 using System.Threading;
@@ -33,7 +34,16 @@ using Transaction = System.Transactions.Transaction;
 namespace Google.Cloud.Spanner.Data
 {
     /// <summary>
-    /// A SpannerConnection represents a connection to a single Spanner database.
+    /// Represents a connection to a single Spanner database.
+    /// When opened, <see cref="SpannerConnection"/> will acquire and maintain a session
+    /// with the target Spanner database.
+    /// <see cref="SpannerCommand"/> instances using this <see cref="SpannerConnection"/>
+    /// will use this session to execute their operation. Concurrent read operations can
+    /// share this session, but concurrent write operations may cause additional sessions
+    /// to be opened to the database.
+    /// Underlying sessions with the Spanner database are pooled and are closed after a
+    /// configurable <see>
+    /// <cref>SpannerOptions.PoolEvictionDelay</cref></see>.
     /// </summary>
     public sealed class SpannerConnection : DbConnection
     {
@@ -77,8 +87,9 @@ namespace Google.Cloud.Spanner.Data
         /// and optional credential information supplied in connectionString or the credential
         /// argument.
         /// </summary>
-        /// <param name="connectionString">A Spanner formatted connection string.</param>
-        /// <param name="credential">An optional credential.</param>
+        /// <param name="connectionString">A Spanner formatted connection string. This is usually of the form 
+        /// `Data Source=projects/{project}/instances/{instance}/databases/{database};[Host={hostname};][Port={portnumber}]`</param>
+        /// <param name="credential">An optional credential for operations to be performed on the Spanner database.  May be null.</param>
         public SpannerConnection(string connectionString, ITokenAccess credential = null)
             : this(new SpannerConnectionStringBuilder(connectionString, credential)) { }
 
@@ -86,8 +97,7 @@ namespace Google.Cloud.Spanner.Data
         /// Creates a SpannerConnection with a datasource contained in connectionString.
         /// </summary>
         /// <param name="connectionStringBuilder">
-        /// A SpannerConnectionStringBuilder containing
-        /// a formatted connection string.
+        /// A SpannerConnectionStringBuilder containing a formatted connection string.  Must not be null.
         /// </param>
         public SpannerConnection(SpannerConnectionStringBuilder connectionStringBuilder)
         {
@@ -99,38 +109,43 @@ namespace Google.Cloud.Spanner.Data
         /// Provides options to customize how connections to Spanner are created
         /// and maintained.
         /// </summary>
-        public static ConnectionPoolOptions ConnectionPoolOptions => ConnectionPoolOptions.Instance;
+        public static SpannerOptions SpannerOptions => SpannerOptions.Instance;
 
         /// <inheritdoc />
         public override string ConnectionString
         {
-            get => _connectionStringBuilder.ToString();
+            get => _connectionStringBuilder?.ToString();
             set => TrySetNewConnectionInfo(
-                new SpannerConnectionStringBuilder(value, _connectionStringBuilder.Credential));
+                new SpannerConnectionStringBuilder(value, _connectionStringBuilder?.Credential));
         }
 
         /// <summary>
-        /// Returns the credential used for the connection, if set.
+        /// The credential used for the connection, if set.
+        /// If credentials are not specified, then application default credentials are used instead.
+        /// See gcloud documentation on how to set up application default credentials.
         /// </summary>
-        public ITokenAccess Credential => _connectionStringBuilder.Credential;
+        public ITokenAccess Credential => _connectionStringBuilder?.Credential;
 
         /// <inheritdoc />
-        public override string Database => _connectionStringBuilder.SpannerDatabase;
+        public override string Database => _connectionStringBuilder?.SpannerDatabase;
 
         /// <inheritdoc />
-        public override string DataSource => _connectionStringBuilder.DataSource;
+        public override string DataSource => _connectionStringBuilder?.DataSource;
 
         /// <summary>
+        /// The Spanner project name.
         /// </summary>
-        public string Project => _connectionStringBuilder.Project;
+        [Category("Data")]
+        public string Project => _connectionStringBuilder?.Project;
 
-        //TODO review server version support.
         /// <inheritdoc />
         public override string ServerVersion => "0.0";
 
         /// <summary>
+        /// The Spanner instance name
         /// </summary>
-        public string SpannerInstance => _connectionStringBuilder.SpannerInstance;
+        [Category("Data")]
+        public string SpannerInstance => _connectionStringBuilder?.SpannerInstance;
 
         /// <inheritdoc />
         public override ConnectionState State => _state;
@@ -142,17 +157,25 @@ namespace Google.Cloud.Spanner.Data
         internal SpannerClient SpannerClient { get; private set; }
 
         /// <summary>
+        /// Begins a readonly transaction using the optionally provided <see cref="CancellationToken"/>
+        /// Read transactions are preferred if possible because they do not impose locks internally.
+        /// ReadOnly transactions run with strong consistency and return the latest copy of data.
         /// </summary>
-        /// <param name="cancellationToken"></param>
-        /// <returns></returns>
+        /// <param name="cancellationToken">An optional token for canceling the call. May be null.</param>
+        /// <returns>a new <see cref="SpannerTransaction"/></returns>
         public Task<SpannerTransaction> BeginReadOnlyTransactionAsync(
             CancellationToken cancellationToken = default(CancellationToken)) => BeginReadOnlyTransactionAsync(
             TimestampBound.Strong, cancellationToken);
 
         /// <summary>
+        /// Begins a readonly transaction using the optionally provided <see cref="CancellationToken"/>
+        /// and provided <see cref="TimestampBound"/> to control the read timestamp and/or staleness
+        /// of data.
+        /// Read transactions are preferred if possible because they do not impose locks internally.
+        /// Stale read-only transactions can execute more quickly than strong or read-write transactions,.
         /// </summary>
-        /// <param name="targetReadTimestamp"></param>
-        /// <param name="cancellationToken"></param>
+        /// <param name="targetReadTimestamp">Specifies the timestamp or allowed staleness of data. Must not be null.</param>
+        /// <param name="cancellationToken">An optional token for canceling the call.</param>
         /// <returns></returns>
         public Task<SpannerTransaction> BeginReadOnlyTransactionAsync(
             TimestampBound targetReadTimestamp,
@@ -208,9 +231,10 @@ namespace Google.Cloud.Spanner.Data
         }
 
         /// <summary>
+        /// Begins a new read/write transaction.
         /// </summary>
-        /// <param name="cancellationToken"></param>
-        /// <returns></returns>
+        /// <param name="cancellationToken">An optional token for canceling the call.</param>
+        /// <returns>A new <see cref="SpannerTransaction"/></returns>
         public Task<SpannerTransaction> BeginTransactionAsync(
             CancellationToken cancellationToken = default(CancellationToken)) => BeginTransactionImplAsync(
             new TransactionOptions
@@ -226,7 +250,7 @@ namespace Google.Cloud.Spanner.Data
                 Close();
             }
 
-            TrySetNewConnectionInfo(_connectionStringBuilder.CloneWithNewDataSource(newDataSource));
+            TrySetNewConnectionInfo(_connectionStringBuilder?.CloneWithNewDataSource(newDataSource));
         }
 
         /// <inheritdoc />
@@ -258,10 +282,14 @@ namespace Google.Cloud.Spanner.Data
         }
 
         /// <summary>
+        /// Creates a new <see cref="SpannerCommand"/> to delete rows from a Spanner database table.
         /// </summary>
-        /// <param name="databaseTable"></param>
-        /// <param name="deleteFilterParameters"></param>
-        /// <returns></returns>
+        /// <param name="databaseTable">The name of the table from which to delete rows. Must not be null.</param>
+        /// <param name="deleteFilterParameters">Filter criteria to control what rows get deleted.
+        /// The name of each <see cref="SpannerParameter"/> should match the column name from the Spanner Table.
+        /// The value of the parameter should be the value to filter for the delete operation.
+        /// May be null.</param>
+        /// <returns>A configured <see cref="SpannerCommand"/></returns>
         public SpannerCommand CreateDeleteCommand(
             string databaseTable,
             SpannerParameterCollection deleteFilterParameters = null) => new SpannerCommand(
@@ -269,10 +297,14 @@ namespace Google.Cloud.Spanner.Data
             deleteFilterParameters);
 
         /// <summary>
+        /// Creates a new <see cref="SpannerCommand"/> to insert rows into a Spanner database table.
         /// </summary>
-        /// <param name="databaseTable"></param>
-        /// <param name="insertParameters"></param>
-        /// <returns></returns>
+        /// <param name="databaseTable">The name of the table to insert rows into. Must not be null.</param>
+        /// <param name="insertParameters">A collection of <see cref="SpannerParameter"/>
+        /// where each instance represents a column in the Spanner database table being set.
+        /// The name of the parameter must match the column name in Spanner. The value
+        /// should be the value of the new row. May be null.</param>
+        /// <returns>A configured <see cref="SpannerCommand"/></returns>
         public SpannerCommand CreateInsertCommand(
             string databaseTable,
             SpannerParameterCollection insertParameters = null) => new SpannerCommand(
@@ -280,10 +312,14 @@ namespace Google.Cloud.Spanner.Data
             insertParameters);
 
         /// <summary>
+        /// Creates a new <see cref="SpannerCommand"/> to insert or update rows into a Spanner database table.
         /// </summary>
-        /// <param name="databaseTable"></param>
-        /// <param name="insertUpdateParameters"></param>
-        /// <returns></returns>
+        /// <param name="databaseTable">The name of the table to insert or updates rows. Must not be null.</param>
+        /// <param name="insertUpdateParameters">A collection of <see cref="SpannerParameter"/>
+        /// where each instance represents a column in the Spanner database table being set.
+        /// The name of the parameter must match the column name in Spanner. The value
+        /// should be the value of the new or updated row. May be null</param>
+        /// <returns>A configured <see cref="SpannerCommand"/></returns>
         public SpannerCommand CreateInsertOrUpdateCommand(
             string databaseTable,
             SpannerParameterCollection insertUpdateParameters = null) => new SpannerCommand(
@@ -291,10 +327,13 @@ namespace Google.Cloud.Spanner.Data
             null, insertUpdateParameters);
 
         /// <summary>
+        /// Creates a new <see cref="SpannerCommand"/> to select rows using a SQL query statement.
         /// </summary>
-        /// <param name="sqlQueryStatement"></param>
-        /// <param name="selectParameters"></param>
-        /// <returns></returns>
+        /// <param name="sqlQueryStatement">A full SQL query statement that may optionally have
+        /// replacement parameters. Must not be null.</param>
+        /// <param name="selectParameters">Optionally supplied set of <see cref="SpannerParameter"/>
+        /// that correspond to the parameters used in the SQL query. May be null.</param>
+        /// <returns>A configured <see cref="SpannerCommand"/></returns>
         public SpannerCommand CreateSelectCommand(
             string sqlQueryStatement,
             SpannerParameterCollection selectParameters = null) => new SpannerCommand(
@@ -302,10 +341,14 @@ namespace Google.Cloud.Spanner.Data
             selectParameters);
 
         /// <summary>
+        /// Creates a new <see cref="SpannerCommand"/> to update rows in a Spanner database table.
         /// </summary>
-        /// <param name="databaseTable"></param>
-        /// <param name="updateParameters"></param>
-        /// <returns></returns>
+        /// <param name="databaseTable">The name of the table to update rows. Must not be null.</param>
+        /// <param name="updateParameters">A collection of <see cref="SpannerParameter"/>
+        /// where each instance represents a column in the Spanner database table being set.
+        /// The name of the parameter must match the column name in Spanner. The value
+        /// should be the value of the updated row. May be null.</param>
+        /// <returns>A configured <see cref="SpannerCommand"/></returns>
         public SpannerCommand CreateUpdateCommand(
             string databaseTable,
             SpannerParameterCollection updateParameters = null) => new SpannerCommand(
@@ -313,9 +356,10 @@ namespace Google.Cloud.Spanner.Data
             updateParameters);
 
         /// <summary>
+        /// Creates a new <see cref="SpannerCommand"/> to execute a DDL (CREATE/DROP TABLE, etc) statement.
         /// </summary>
-        /// <param name="ddlStatement"></param>
-        /// <returns></returns>
+        /// <param name="ddlStatement">The DDL statement (eg 'CREATE TABLE MYTABLE ...').  Must not be null.</param>
+        /// <returns>A configured <see cref="SpannerCommand"/></returns>
         public SpannerCommand CreateDdlCommand(
             string ddlStatement) => new SpannerCommand(
             SpannerCommandTextBuilder.CreateDdlTextBuilder(ddlStatement), this);
@@ -328,7 +372,7 @@ namespace Google.Cloud.Spanner.Data
                 return;
             }
 
-            Task.Run(OpenAsync).Wait(ConnectionPoolOptions.Instance.Timeout);
+            Task.Run(OpenAsync).Wait(SpannerOptions.Instance.Timeout);
         }
 
         /// <inheritdoc />
@@ -342,7 +386,7 @@ namespace Google.Cloud.Spanner.Data
                 {
                     if (string.IsNullOrEmpty(_connectionStringBuilder?.SpannerDatabase))
                     {
-                        Logger.Warn(() => "No database was defined.  Therefore OpenAsync did not establish a session.");
+                        Logger.Warn(() => "No database was defined. Therefore OpenAsync did not establish a session.");
                         return;
                     }
                     if (IsOpen)
@@ -387,8 +431,10 @@ namespace Google.Cloud.Spanner.Data
                     {
                         _state = _sharedSession != null ? ConnectionState.Open : ConnectionState.Broken;
 #if NET45 || NET451
-                    if (IsOpen && currentTransaction != null)
-                        EnlistTransaction(currentTransaction);
+                        if (IsOpen && currentTransaction != null)
+                        {
+                            EnlistTransaction(currentTransaction);
+                        }
 #endif
                     }
                 }, "SpannerConnection.OpenAsync");
@@ -397,9 +443,12 @@ namespace Google.Cloud.Spanner.Data
 #if NET45 || NET451
 
         /// <summary>
+        /// Opens and establishes a session with the Spanner database with the given
+        /// <see cref="TimestampBound"/> settings that control the implicit transaction created
+        /// from the active <see cref="System.Transactions.TransactionScope"/>
         /// </summary>
-        /// <param name="timestampBound"></param>
-        /// <returns></returns>
+        /// <param name="timestampBound">Specifies the timestamp or maximum staleness of a
+        /// read operation. Must not be null.</param>
         public void OpenWithTimeBoundSettings(TimestampBound timestampBound)
         {
             _timestampBound = timestampBound;
@@ -407,10 +456,13 @@ namespace Google.Cloud.Spanner.Data
         }
 
         /// <summary>
+        /// Opens and establishes a session with the Spanner database asynchronously with the given
+        /// <see cref="TimestampBound"/> settings that control the implicit transaction created
+        /// from the active <see cref="System.Transactions.TransactionScope"/>
         /// </summary>
-        /// <param name="timestampBound"></param>
-        /// <param name="cancellationToken"></param>
-        /// <returns></returns>
+        /// <param name="timestampBound">Specifies the timestamp or maximum staleness of a
+        /// read operation. Must not be null.</param>
+        /// <param name="cancellationToken">An optional token for canceling the call.</param>
         public Task OpenWithTimeBoundSettingsAsync(TimestampBound timestampBound, CancellationToken cancellationToken)
         {
             _timestampBound = timestampBound;
@@ -441,7 +493,9 @@ namespace Google.Cloud.Spanner.Data
         {
 #if NET45 || NET451
             if (_volatileResourceManager != null)
+            {
                 return _volatileResourceManager;
+            }
 #endif
             return new EphemeralTransaction(this);
         }
@@ -529,7 +583,7 @@ namespace Google.Cloud.Spanner.Data
                         {
                             sharedSessionReadOnlyUse = true;
                             // If we enter this code path, it means a transaction has stolen our shared session.
-                            // This is ok, we'll just create another.  But need to be very careful about concurrency
+                            // This is ok, we'll just create another. But need to be very careful about concurrency
                             // as compared to OpenAsync (which is documented as not threadsafe).
                             // To make this threadsafe, we store the creation task as a member and let other callers
                             // hook onto the first creation task.
@@ -600,7 +654,7 @@ namespace Google.Cloud.Spanner.Data
         {
             if (!IsClosed)
             {
-                throw new InvalidOperationException("The connection must be closed.  Failed to " + message);
+                throw new InvalidOperationException("The connection must be closed. Failed to " + message);
             }
         }
 
@@ -608,7 +662,7 @@ namespace Google.Cloud.Spanner.Data
         {
             if (!IsOpen)
             {
-                throw new InvalidOperationException("The connection must be open.  Failed to " + message);
+                throw new InvalidOperationException("The connection must be open. Failed to " + message);
             }
         }
 
@@ -660,7 +714,7 @@ namespace Google.Cloud.Spanner.Data
                 Sql = "SELECT 1"
             };
 
-            var task = Task.Delay(ConnectionPoolOptions.KeepAliveInterval, cancellationToken);
+            var task = Task.Delay(SpannerOptions.KeepAliveInterval, cancellationToken);
             var loopTask = task.ContinueWith(
                 async t =>
                 {
@@ -741,22 +795,29 @@ namespace Google.Cloud.Spanner.Data
 #if NET45 || NET451
 
         /// <summary>
+        /// Gets or Sets whether to participate in the active <see cref="System.Transactions.TransactionScope"/>
         /// </summary>
+        // ReSharper disable once AutoPropertyCanBeMadeGetOnly.Global
+        // ReSharper disable once MemberCanBePrivate.Global
         public bool EnlistInTransaction { get; set; } = true;
 
         /// <inheritdoc />
         public override void EnlistTransaction(Transaction transaction)
         {
-            if (!EnlistInTransaction) return;
+            if (!EnlistInTransaction)
+            {
+                return;
+            }
             if (_volatileResourceManager != null)
+            {
                 throw new InvalidOperationException("This connection is already enlisted to a transaction.");
+            }
             _volatileResourceManager = new VolatileResourceManager(this, _timestampBound);
             transaction.EnlistVolatile(_volatileResourceManager, System.Transactions.EnlistmentOptions.None);
         }
 
         /// <inheritdoc />
         protected override DbProviderFactory DbProviderFactory => SpannerProviderFactory.Instance;
-
 #endif
     }
 }
